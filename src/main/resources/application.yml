@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: r2dbc-exchange-leak-issue
+  r2dbc:
+    url: r2dbc:mariadb://localhost:3306/testdb
+    username: testuser
+    password: testpass
+    pool:
+      initial-size: 2
+      max-size: 2
+      validation-query: SELECT 1
+
+logging:
+  level:
+    org.mariadb.r2dbc: TRACE
