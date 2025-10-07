@@ -27,25 +27,60 @@ To debug the Exchange leak issue, you need to add debug logs to the MariaDB R2DB
      https://raw.githubusercontent.com/mariadb-corporation/mariadb-connector-r2dbc/1.3.0/src/main/java/org/mariadb/r2dbc/client/SimpleClient.java
    ```
 
-2. Add debug log in the `sendCommand` method (around line 630):
-   ```java
-   logger.info("sendCommand ==> exchange:{}, hasDemand: {}, cancelled: {}",
-       exchange, exchange.hasDemand(), exchange.isCancelled());
+2. Apply the following debug log patches:
+
+   **In `sendCommand` method (around line 630):**
+   ```diff
+   @@ -627,6 +627,7 @@
+              if (message instanceof PreparePacket) {
+                decoder.addPrepare(((PreparePacket) message).getSql());
+              }
+   +          logger.info("sendCommand ==> exchange:{}, hasDemand: {}, cancelled: {}", exchange, exchange.hasDemand(), exchange.isCancelled());
+              sink.onRequest(value -> messageSubscriber.onRequest(exchange, value));
+              this.requestSink.emitNext(message, Sinks.EmitFailureHandler.FAIL_FAST);
+            } else {
    ```
 
-3. Add debug log in the `onNext` method of `ServerMessageSubscriber` inner class:
-   ```java
-   logger.info("onNext ==> message: {}, exchange: {}, hasDemand: {}, cancelled: {}, receiverQueue.size: {}",
-       message.getClass().getSimpleName(), exchange,
-       exchange != null ? exchange.hasDemand() : "null",
-       exchange != null ? exchange.isCancelled() : "null",
-       this.receiverQueue.size());
+   **In `sendCommand` (prepare+execute) method (around line 683):**
+   ```diff
+   @@ -680,6 +681,7 @@
+                new Exchange(
+                    sink, DecoderState.PREPARE_AND_EXECUTE_RESPONSE, preparePacket.getSql());
+            if (this.exchangeQueue.offer(exchange)) {
+   +          logger.info("sendCommand (prepare+execute) ==> exchange:{}, hasDemand: {}, cancelled: {}", exchange, exchange.hasDemand(), exchange.isCancelled());
+              sink.onRequest(value -> messageSubscriber.onRequest(exchange, value));
+              decoder.addPrepare(preparePacket.getSql());
+              this.requestSink.emitNext(preparePacket, Sinks.EmitFailureHandler.FAIL_FAST);
    ```
 
-4. Add debug log in the `onRequest` method of `ServerMessageSubscriber` inner class:
-   ```java
-   logger.info("onRequest ==> exchange: {}, demand: {}, hasDemand: {}, cancelled: {}",
-       exchange, n, exchange.hasDemand(), exchange.isCancelled());
+   **In `onNext` method of `ServerMessageSubscriber` inner class (around line 766):**
+   ```diff
+   @@ -764,6 +766,11 @@
+
+          this.receiverDemands.decrementAndGet();
+          Exchange exchange = this.exchangeQueue.peek();
+   +
+   +      logger.info("onNext ==> message: {}, exchange: {}, hasDemand: {}, cancelled: {}, receiverQueue.size: {}",
+   +          message.getClass().getSimpleName(), exchange,
+   +          exchange != null ? exchange.hasDemand() : "null",
+   +          exchange != null ? exchange.isCancelled() : "null",
+   +          this.receiverQueue.size());
+
+          // nothing buffered => directly emit message
+          ReferenceCountUtil.retain(message);
+   ```
+
+   **In `onRequest` method of `ServerMessageSubscriber` inner class (around line 789):**
+   ```diff
+   @@ -787,6 +794,8 @@
+        }
+
+        public void onRequest(Exchange exchange, long n) {
+   +      logger.info("onRequest ==> exchange: {}, demand: {}, hasDemand: {}, cancelled: {}",
+   +          exchange, n, exchange.hasDemand(), exchange.isCancelled());
+          exchange.incrementDemand(n);
+          requestQueueFilling();
+          tryDrainQueue();
    ```
 
 ### 2. Start MariaDB
