@@ -97,9 +97,11 @@ docker compose up -d
 
 ## How to Reproduce the Exchange Leak
 
-### 1. Trigger client aborts with short timeout
+![Exchange leak demonstration](demo.gif)
 
-First, execute 100 requests with short timeout to force client aborts. And then, send a normal request.
+### 1. Trigger client aborts with a short timeout
+
+First, execute 100 requests with a short timeout to force a client aborts. And then, send a normal request.
 
 ```bash
 for i in $(seq 100); do curl "http://localhost:8080/api/users" -m 0.002; done
@@ -107,6 +109,53 @@ for i in $(seq 100); do curl "http://localhost:8080/api/users" -m 0.002; done
 curl "http://localhost:8080/api/users"
 ```
 
-Verify that this request hangs.
+Verify that this request hangs indefinitely (as shown in the demonstration above).
 
 **Note**: Depending on your environment, you may need to repeat the above steps several times to reproduce the leak.
+
+## Log Analysis
+
+When the leak occurs, you can verify the issue by analyzing the debug logs:
+
+### 1. Identify the leaked Exchange
+
+Search for an Exchange with `hasDemand: false` and `cancelled: true`:
+
+```bash
+$ grep 'hasDemand: false, cancelled: true' app.log | head -n 1
+2025-10-08T11:17:50.776+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : sendCommand ==> exchange:org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true
+```
+
+### 2. Trace the Exchange behavior
+
+Extract all logs related to the leaked Exchange (e.g., `Exchange@3bdc39f7`):
+
+```bash
+$ grep 'Exchange@3bdc39f7' app.log
+```
+
+**Key observations:**
+
+1. The Exchange is created with `hasDemand: false, cancelled: true` in the `sendCommand` method
+2. **No `onRequest` calls are made** for this cancelled Exchange, leaving demand at 0
+3. Messages continue to arrive via `onNext`, but cannot be emitted due to zero demand
+4. The `receiverQueue` size keeps growing: 0 → 1 → 2 → ... → 187
+
+**Example log output:**
+
+```
+2025-10-08T11:17:50.776+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : sendCommand ==> exchange:org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true
+2025-10-08T11:17:50.776+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: ColumnCountPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 0
+2025-10-08T11:17:50.777+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: ColumnDefinitionPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 1
+2025-10-08T11:17:50.777+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: ColumnDefinitionPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 2
+2025-10-08T11:17:50.777+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: ColumnDefinitionPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 3
+2025-10-08T11:17:50.777+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: EofPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 4
+2025-10-08T11:17:50.777+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: RowPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 5
+...
+2025-10-08T11:17:51.933+09:00  INFO 94276 --- [r2dbc-exchange-leak-issue] [actor-tcp-nio-3] org.mariadb.r2dbc.client.SimpleClient    : onNext ==> message: ColumnDefinitionPacket, exchange: org.mariadb.r2dbc.client.Exchange@3bdc39f7, hasDemand: false, cancelled: true, receiverQueue.size: 187
+```
+
+This demonstrates that:
+- The cancelled Exchange remains at the head of the `exchangeQueue`
+- Messages accumulate in the `receiverQueue` without being consumed
+- The Exchange is never removed from the queue, blocking all later requests
